@@ -1,0 +1,32 @@
+# Upstream Omi reference clone — not part of mechie
+omi/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+*.log
+
+# Env
+.env
+.env.local
+.env*.local
+
+# Build / cache
+dist/
+build/
+.cache/
+.expo/
+*.tsbuildinfo

@@ -1,0 +1,37 @@
+# fly.toml app configuration file generated for omi-relay-aksay95 on 2026-05-06T03:32:24-07:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'omi-relay-aksay95'
+primary_region = 'sjc'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PORT = '8765'
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8765
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls']
+
+  [[services.ports]]
+    port = 80
+
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 50
+    soft_limit = 25
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

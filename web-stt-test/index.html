@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Omi Glass — Browser STT Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; color: #111; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .row { display: flex; gap: 8px; margin: 12px 0; }
+    input { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
+    button { padding: 8px 14px; border: 0; border-radius: 6px; background: #111; color: #fff; font: inherit; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { padding: 10px 12px; background: #f4f4f5; border-radius: 6px; font: 12px ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; font: 12px ui-monospace, Menlo, monospace; }
+    .stat { padding: 8px; background: #f4f4f5; border-radius: 6px; }
+    .stat b { display: block; font-size: 16px; font-family: system-ui; font-weight: 600; }
+    pre#transcript { padding: 12px; background: #fafafa; border: 1px solid #eee; border-radius: 6px; min-height: 160px; max-height: 320px; overflow: auto; white-space: pre-wrap; word-wrap: break-word; }
+    .interim { color: #999; }
+    .hint { font-size: 12px; color: #666; margin-top: 4px; }
+    h2 { font-size: 14px; margin: 20px 0 6px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+    #photoGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; padding: 8px; background: #fafafa; border: 1px solid #eee; border-radius: 6px; min-height: 180px; max-height: 520px; overflow: auto; }
+    .photo { position: relative; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 4px; background: #e5e7eb; }
+    .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .photo .ts { position: absolute; bottom: 0; left: 0; right: 0; padding: 2px 6px; font: 10px ui-monospace, Menlo, monospace; color: #fff; background: rgba(0,0,0,0.55); }
+    .rot0   { transform: rotate(0deg); }
+    .rot90  { transform: rotate(90deg); }
+    .rot180 { transform: rotate(180deg); }
+    .rot270 { transform: rotate(270deg); }
+  </style>
+</head>
+<body>
+  <h1>Omi Glass — Browser STT Test</h1>
+  <p class="hint">Web Bluetooth → Opus decode (WASM) → Deepgram live STT. Chrome/Edge only. Make sure the omi mobile app is closed (BLE peripherals only pair to one central at a time).</p>
+
+  <div class="row">
+    <input id="dgKey" type="text" placeholder="Deepgram API key" autocomplete="off" spellcheck="false" autocapitalize="off" />
+    <button id="connect">Connect glasses</button>
+  </div>
+  <div class="hint">Key is kept in memory only. Get one free at deepgram.com — $200 credit on signup.</div>
+
+  <div class="status" id="status">Idle. Enter Deepgram key, then click Connect.</div>
+
+  <div class="stats">
+    <div class="stat"><span>BLE packets</span><b id="bleCount">0</b></div>
+    <div class="stat"><span>Opus frames</span><b id="frameCount">0</b></div>
+    <div class="stat"><span>PCM samples</span><b id="pcmCount">0</b></div>
+    <div class="stat"><span>Audio lost</span><b id="lostCount">0</b></div>
+  </div>
+
+  <h2>Transcript</h2>
+  <pre id="transcript"></pre>
+
+  <div class="stats">
+    <div class="stat"><span>Photo packets</span><b id="photoPktCount">0</b></div>
+    <div class="stat"><span>Photos done</span><b id="photoDoneCount">0</b></div>
+    <div class="stat"><span>Photo bytes</span><b id="photoByteCount">0</b></div>
+    <div class="stat"><span>Photo lost</span><b id="photoLostCount">0</b></div>
+  </div>
+
+  <h2>Photos</h2>
+  <div id="photoGrid"></div>
+
+  <script type="module">
+    import { OpusDecoder } from 'https://cdn.jsdelivr.net/npm/opus-decoder@0.7.7/+esm';
+
+    // omi BLE service / characteristics (from omi/app/lib/services/devices/models.dart)
+    const SERVICE_UUID         = '19b10000-e8f2-537e-4f6c-d104768a1214';
+    const AUDIO_CHAR_UUID      = '19b10001-e8f2-537e-4f6c-d104768a1214';
+    const CODEC_CHAR_UUID      = '19b10002-e8f2-537e-4f6c-d104768a1214';
+    const IMAGE_DATA_UUID      = '19b10005-e8f2-537e-4f6c-d104768a1214';
+    const IMAGE_CONTROL_UUID   = '19b10006-e8f2-537e-4f6c-d104768a1214';
+    // Firmware control bytes (omiGlass/firmware/src/app.cpp:726):
+    //   0xFF (-1) = single shot (no interval)
+    //   0x00      = stop
+    //   5..300    = interval mode, BUT firmware ignores the value and uses its compile-time
+    //               PHOTO_CAPTURE_INTERVAL_MS constant. So to maximize rate we use single-shot
+    //               and re-arm after every completed photo.
+    const PHOTO_CMD_SINGLE_SHOT = 0xFF;
+    const PHOTO_END_OF_IMAGE    = 0xFFFF;
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (m) => { $('status').textContent = m; console.log('[status]', m); };
+
+    let decoder = null;
+    let dgWs = null;
+    let bleCount = 0, frameCount = 0, pcmCount = 0, lostCount = 0;
+    let photoPktCount = 0, photoDoneCount = 0, photoByteCount = 0, photoLostCount = 0;
+    let photoControlChar = null;   // kept around so we can re-arm single-shot after each photo
+
+    // Audio frame reassembly state (mirrors omi/app/lib/utils/audio/wav_bytes.dart:98)
+    let pending = null;
+    let lastPacketIndex = -1;
+    let lastFrameId = -1;
+
+    // Photo frame reassembly state (mirrors omi/app/lib/services/devices/omiglass_connection.dart:553)
+    let photoBuffer = [];           // array of Uint8Array chunks
+    let photoBufferLen = 0;
+    let photoNextFrame = 0;
+    let photoTransferring = false;
+    let photoOrientation = 0;       // 0=0°, 1=90°, 2=180°, 3=270°
+
+    const updateStats = () => {
+      $('bleCount').textContent = bleCount;
+      $('frameCount').textContent = frameCount;
+      $('pcmCount').textContent = pcmCount;
+      $('lostCount').textContent = lostCount;
+      $('photoPktCount').textContent = photoPktCount;
+      $('photoDoneCount').textContent = photoDoneCount;
+      $('photoByteCount').textContent = photoByteCount;
+      $('photoLostCount').textContent = photoLostCount;
+    };
+
+    async function connect() {
+      const apiKey = $('dgKey').value.trim();
+      if (!apiKey) { alert('Enter a Deepgram API key first.'); return; }
+      // Sanity-check: WebSocket subprotocols must be RFC 7230 tokens. Deepgram keys are
+      // 40-char alphanumerics — anything with /, :, . is almost certainly not a key.
+      if (!/^[A-Za-z0-9_-]+$/.test(apiKey)) {
+        alert('That doesn\'t look like a Deepgram API key (contains invalid characters). Clear the field and paste only the key.');
+        return;
+      }
+      $('connect').disabled = true;
+
+      try {
+        setStatus('Loading Opus decoder…');
+        decoder = new OpusDecoder({ sampleRate: 16000, channels: 1 });
+        await decoder.ready;
+
+        setStatus('Opening Deepgram WebSocket…');
+        await openDeepgram(apiKey);
+
+        setStatus('Requesting BLE device — pick your glasses in the picker…');
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }],
+          optionalServices: [SERVICE_UUID],
+        });
+        device.addEventListener('gattserverdisconnected', () => setStatus('Glasses disconnected.'));
+
+        setStatus('Connecting GATT…');
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+
+        // Read codec — omi: 1=PCM8, 20=Opus, 21=OpusFS320
+        const codecChar = await service.getCharacteristic(CODEC_CHAR_UUID);
+        const codecVal = await codecChar.readValue();
+        const codecId = codecVal.getUint8(0);
+        const codecName = { 1: 'PCM8', 20: 'Opus', 21: 'OpusFS320' }[codecId] ?? `unknown(${codecId})`;
+        if (codecId !== 20 && codecId !== 21) {
+          throw new Error(`This page only handles Opus. Device reports codec ${codecName}.`);
+        }
+        setStatus(`Codec ${codecName}. Subscribing to audio characteristic…`);
+
+        const audioChar = await service.getCharacteristic(AUDIO_CHAR_UUID);
+        audioChar.addEventListener('characteristicvaluechanged', onBleAudio);
+        await audioChar.startNotifications();
+
+        // Photo stream — subscribe first, then fire the first single-shot.
+        try {
+          const imageChar = await service.getCharacteristic(IMAGE_DATA_UUID);
+          imageChar.addEventListener('characteristicvaluechanged', onBlePhoto);
+          await imageChar.startNotifications();
+
+          photoControlChar = await service.getCharacteristic(IMAGE_CONTROL_UUID);
+          await triggerSinglePhoto();
+          console.log('[photo] capture armed (single-shot, will re-arm after each frame)');
+        } catch (err) {
+          console.warn('[photo] setup failed:', err);
+        }
+
+        setStatus(`Streaming audio (${codecName}) → Deepgram. Photos as fast as firmware allows. Speak into the glasses…`);
+      } catch (err) {
+        console.error(err);
+        setStatus('Error: ' + err.message);
+        $('connect').disabled = false;
+      }
+    }
+
+    function openDeepgram(apiKey) {
+      return new Promise((resolve, reject) => {
+        const params = new URLSearchParams({
+          encoding: 'linear16',
+          sample_rate: '16000',
+          channels: '1',
+          model: 'nova-3',
+          interim_results: 'true',
+          smart_format: 'true',
+          endpointing: '300',
+        });
+        const url = `wss://api.deepgram.com/v1/listen?${params}`;
+        dgWs = new WebSocket(url, ['token', apiKey]);
+        dgWs.binaryType = 'arraybuffer';
+        dgWs.onopen = () => { console.log('[dg] open'); resolve(); };
+        dgWs.onerror = (e) => { console.error('[dg] error', e); reject(new Error('Deepgram WebSocket error — check API key and console')); };
+        dgWs.onclose = (e) => { console.log('[dg] close', e.code, e.reason); setStatus(`Deepgram closed (${e.code}). ${e.reason || ''}`.trim()); };
+        dgWs.onmessage = onDeepgramMsg;
+      });
+    }
+
+    function onDeepgramMsg(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type !== 'Results') return;
+      const alt = msg.channel?.alternatives?.[0];
+      if (!alt?.transcript) return;
+      const t = alt.transcript;
+      const el = $('transcript');
+      if (msg.is_final) {
+        // Drop any trailing interim line
+        const lines = el.textContent.split('\n');
+        if (lines.length && lines[lines.length - 1].startsWith('…')) lines.pop();
+        el.textContent = lines.join('\n') + (lines.length ? '\n' : '') + t + '\n';
+      } else {
+        const lines = el.textContent.split('\n');
+        if (lines.length && lines[lines.length - 1].startsWith('…')) lines.pop();
+        el.textContent = lines.join('\n') + (lines.length ? '\n' : '') + '… ' + t;
+      }
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // BLE audio packet:
+    //   bytes [0..1] = uint16 LE packet index (global, monotonic)
+    //   byte  [2]    = internal frame id (0 = start of new Opus frame, n = nth continuation)
+    //   bytes [3..]  = opus payload (or fragment)
+    function onBleAudio(e) {
+      bleCount++;
+      const dv = e.target.value;
+      if (dv.byteLength < 4) { updateStats(); return; }
+
+      const packetIndex = dv.getUint16(0, true);
+      const internal = dv.getUint8(2);
+      const payload = new Uint8Array(dv.buffer, dv.byteOffset + 3, dv.byteLength - 3);
+
+      // First packet ever: must be start of a frame
+      if (lastPacketIndex === -1 && internal === 0) {
+        pending = new Uint8Array(payload);
+        lastPacketIndex = packetIndex;
+        lastFrameId = 0;
+        updateStats();
+        return;
+      }
+      if (lastPacketIndex === -1) { updateStats(); return; }
+
+      // Lost packet — global index must be sequential, and continuations must increment
+      if (packetIndex !== lastPacketIndex + 1 ||
+          (internal !== 0 && internal !== lastFrameId + 1)) {
+        lostCount++;
+        lastPacketIndex = -1;
+        pending = null;
+        updateStats();
+        return;
+      }
+
+      if (internal === 0) {
+        // Start of a new frame → flush the previous (now complete) frame to the decoder
+        if (pending && pending.length > 0) flushFrame(pending);
+        pending = new Uint8Array(payload);
+      } else {
+        // Continuation — append
+        const merged = new Uint8Array(pending.length + payload.length);
+        merged.set(pending, 0);
+        merged.set(payload, pending.length);
+        pending = merged;
+      }
+      lastFrameId = internal;
+      lastPacketIndex = packetIndex;
+      updateStats();
+    }
+
+    // Photo packet:
+    //   bytes [0..1] = uint16 LE frame index (0 = start of new image, 0xFFFF = end-of-image marker)
+    //   first packet (frameIndex == 0): byte [2] = orientation (0..3), bytes [3..] = JPEG
+    //   subsequent packets:             bytes [2..] = JPEG continuation
+    //   end packet (frameIndex == 0xFFFF): no payload, flush buffer as JPEG
+    // Mirrors omi/app/lib/services/devices/omiglass_connection.dart:553
+    function onBlePhoto(e) {
+      photoPktCount++;
+      const dv = e.target.value;
+      if (dv.byteLength < 2) { updateStats(); return; }
+
+      const frameIndex = dv.getUint16(0, true);
+
+      if (frameIndex === PHOTO_END_OF_IMAGE) {
+        if (photoTransferring && photoBufferLen > 0) {
+          const jpeg = concatChunks(photoBuffer, photoBufferLen);
+          photoDoneCount++;
+          photoByteCount += jpeg.length;
+          renderPhoto(jpeg, photoOrientation);
+        }
+        resetPhotoBuffer();
+        updateStats();
+        // Re-arm immediately so the firmware captures another photo as soon as it's idle.
+        // Single-shot mode self-clears `isCapturingPhotos` after one capture (app.cpp:922),
+        // so without this we'd only ever get a single photo.
+        triggerSinglePhoto();
+        return;
+      }
+
+      if (frameIndex === 0) {
+        // Start of a new image — discard any in-flight buffer
+        resetPhotoBuffer();
+        photoTransferring = true;
+        if (dv.byteLength > 2) photoOrientation = dv.getUint8(2);
+        if (dv.byteLength > 3) appendPhotoChunk(new Uint8Array(dv.buffer, dv.byteOffset + 3, dv.byteLength - 3));
+        photoNextFrame = 1;
+        updateStats();
+        return;
+      }
+
+      if (!photoTransferring) { updateStats(); return; }
+
+      if (frameIndex !== photoNextFrame) {
+        // Out of order — image is corrupt, drop it
+        photoLostCount++;
+        resetPhotoBuffer();
+        updateStats();
+        return;
+      }
+
+      if (dv.byteLength > 2) appendPhotoChunk(new Uint8Array(dv.buffer, dv.byteOffset + 2, dv.byteLength - 2));
+      photoNextFrame++;
+      // Safety cap matches Flutter app — discard runaway transfers
+      if (photoBufferLen > 200 * 1024) resetPhotoBuffer();
+      updateStats();
+    }
+
+    async function triggerSinglePhoto() {
+      if (!photoControlChar) return;
+      try {
+        await photoControlChar.writeValue(new Uint8Array([PHOTO_CMD_SINGLE_SHOT]));
+      } catch (err) {
+        console.warn('[photo] re-arm write failed:', err);
+      }
+    }
+
+    function appendPhotoChunk(u8) {
+      // Copy because the underlying DataView buffer is reused by Web Bluetooth
+      const copy = new Uint8Array(u8.length);
+      copy.set(u8);
+      photoBuffer.push(copy);
+      photoBufferLen += copy.length;
+    }
+
+    function resetPhotoBuffer() {
+      photoBuffer = [];
+      photoBufferLen = 0;
+      photoNextFrame = 0;
+      photoTransferring = false;
+    }
+
+    function concatChunks(chunks, total) {
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.length; }
+      return out;
+    }
+
+    function renderPhoto(jpegBytes, orientationCode) {
+      const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const wrap = document.createElement('div');
+      wrap.className = 'photo';
+      const img = document.createElement('img');
+      img.className = `rot${[0, 90, 180, 270][orientationCode] ?? 0}`;
+      img.src = url;
+      img.onload = () => URL.revokeObjectURL(url);
+      const ts = document.createElement('div');
+      ts.className = 'ts';
+      const now = new Date();
+      ts.textContent = `${now.toLocaleTimeString()} · ${(jpegBytes.length / 1024).toFixed(1)} KB`;
+      wrap.appendChild(img);
+      wrap.appendChild(ts);
+      const grid = $('photoGrid');
+      grid.insertBefore(wrap, grid.firstChild);
+      // Keep at most 24 thumbnails to bound memory
+      while (grid.children.length > 24) grid.removeChild(grid.lastChild);
+    }
+
+    function flushFrame(opusFrame) {
+      try {
+        const { channelData, samplesDecoded } = decoder.decodeFrame(opusFrame);
+        if (!samplesDecoded) return;
+        frameCount++;
+        const f32 = channelData[0];
+        // Float32 → Int16 (linear16) for Deepgram
+        const i16 = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const s = Math.max(-1, Math.min(1, f32[i]));
+          i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        pcmCount += i16.length;
+        if (dgWs && dgWs.readyState === WebSocket.OPEN) dgWs.send(i16.buffer);
+      } catch (err) {
+        console.warn('opus decode failed', err, 'frame len', opusFrame.length);
+      }
+    }
+
+    $('connect').addEventListener('click', connect);
+  </script>
+</body>
+</html>
