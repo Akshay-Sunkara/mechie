@@ -1,8 +1,9 @@
 // Relay: phone ↔ OpenAI Realtime gateway. The phone uploads Opus + JPEGs
 // over a single WS; the relay decodes audio to 24 kHz PCM, opens an OpenAI
 // Realtime WS that handles STT + reasoning + tool calls + native audio
-// output, buffers the full PCM reply, and ships it as one self-contained
-// 24 kHz WAV per turn for gapless file-based playback on the phone.
+// output, and streams the model's PCM reply chunk-by-chunk to the phone so
+// playback can start ~hundreds of ms after the first audio byte arrives
+// instead of waiting for the full turn.
 //
 // Wire protocol:
 //   Phone → Relay binary:
@@ -16,7 +17,10 @@
 //                                  re-emits the realtime transcript in that
 //                                  shape), plus {type:"request_photo", id}
 //                                  and {type:"agent_chunk", text}.
-//     binary: 0x10 [WAV bytes]     full 24 kHz mono S16LE WAV of model audio
+//     binary: 0x10 [flags 1B][PCM] one chunk of 24 kHz mono S16LE PCM model
+//                                  audio. flags bit0=isFirst (first chunk of
+//                                  turn), bit1=isFinal (last chunk of turn —
+//                                  payload may be empty).
 //     binary: 0x20 [JPEG bytes]    Wi-Fi-photo dev mirror
 //
 // Glasses → Relay HTTP: POST /upload-photo with x-session-token + x-request-id.
@@ -106,115 +110,64 @@ const PHOTO_REQUEST_TIMEOUT_MS = 20000;
 // Wire-protocol tag bytes
 const TAG_PHONE_OPUS = 0x01;
 const TAG_PHONE_PHOTO = 0x02;
-const TAG_RELAY_TTS = 0x10;        // self-contained WAV of model audio
+const TAG_RELAY_PCM = 0x10;        // streaming PCM chunk (24 kHz S16LE)
 const TAG_RELAY_WIFI_PHOTO = 0x20; // mirror of Wi-Fi-uploaded JPEG (dev grid)
 
+// Streaming-chunk flag bits (second byte of TAG_RELAY_PCM frames).
+const PCM_FLAG_FIRST = 0x01;
+const PCM_FLAG_FINAL = 0x02;
+
 const GUIDANCE_SYSTEM_PROMPT =
-  'You are an interactive hands-on task coach for someone wearing smart glasses with a camera. ' +
-  'Your replies are spoken aloud.\n\n' +
-  'RESPONSE LENGTH:\n' +
-  'Default to 1-2 sentences. You CAN go longer when the situation truly requires it — explaining ' +
-  'a multi-step procedure that can\'t reasonably split, defining a complex term the user asked ' +
-  'about — but in normal conversation 1-2 sentences is what you do. Don\'t pad. Don\'t recap what ' +
-  'the user just said. Don\'t add "let me know if you need anything else" filler. Speak like a ' +
-  'concise colleague.\n\n' +
-  'VISION — IMPORTANT:\n' +
-  'You DO NOT see the user\'s environment by default. You have a `take_picture` tool that ' +
-  'captures a fresh photo from their glasses. Call it EAGERLY — err on the side of taking ' +
-  'a picture. The latency is hidden by speculative pre-capture, so calling it costs almost nothing.\n\n' +
-  'CALL `take_picture` whenever the user:\n' +
-  '- Refers to a physical object with "this", "that", "it", "here", "there" ("how do I turn this off", ' +
-  '"what is this", "is this right", "where\'s the button on this")\n' +
-  '- Asks you to look, see, check, watch, or verify ("look at this", "check my work", "see the screen")\n' +
-  '- Asks any question whose answer depends on the physical scene in front of them\n' +
-  '- Reports completing a step in a hands-on task (verify before moving on)\n' +
-  '- Asks for help with anything physical and you don\'t already have a recent photo\n\n' +
-  'DO NOT call `take_picture` for:\n' +
-  '- Pure greetings ("hi", "can you hear me", "are you there")\n' +
-  '- Abstract / conceptual questions with no physical referent ("what\'s the capital of France")\n' +
-  '- Direct follow-ups about something you JUST saw in this turn\n\n' +
-  'NEVER tell the user "I can\'t see" or "I don\'t have a camera" — you have one, you just have ' +
-  'to call the tool. If you need to see, call `take_picture`. Do not refuse a visual question; ' +
-  'fulfill it by capturing a photo.\n\n' +
-  'HONEST ABOUT WHAT YOU SEE — DO NOT HALLUCINATE:\n' +
-  'After calling `take_picture`, only describe things that are clearly, unambiguously visible in ' +
-  'the actual image. NEVER invent objects, animals, people, text, or scenes that aren\'t there.\n' +
-  '- If the photo is dark, black, or empty, say "the camera looks covered" or "it\'s too dark to ' +
-  'see anything" and ask the user to uncover the lens or move into better light.\n' +
-  '- If the photo is blurry or you can only make out vague shapes, say so honestly ("I see ' +
-  'something blurry, can you describe what you\'re looking at?").\n' +
-  '- If you\'re uncertain what an object is, ASK rather than guess.\n' +
-  '- The tool may return a message saying the lens appears covered — when it does, trust that and ' +
-  'tell the user; do not try to invent what might be there.\n' +
-  'Inventing visual content the user didn\'t actually show you is the worst failure mode of this ' +
-  'system. Always prefer "I can\'t tell" over a confident guess.\n\n' +
-  'RULES:\n' +
-  '- For hands-on tasks (cooking, electronics, repair, assembly, art), walk them through it ONE ' +
-  'STEP AT A TIME. Give exactly one step per reply, end with a brief check-in like "Let me know ' +
-  'when you\'re done."\n' +
-  '- When they say they\'re done with a step, call `take_picture` and VERIFY before moving on. ' +
-  'Praise good work; gently correct mistakes.\n' +
-  '- If a captured photo is unclear or doesn\'t show what you need, ASK them to adjust ("tilt down ' +
-  'a bit", "can you describe what I should be seeing") — never guess.\n' +
-  '- For greetings or connection tests, reply briefly and ask what they want help with — do NOT ' +
-  'invent a task from a photo.\n' +
-  '- For pure casual questions, answer conversationally without forcing a task flow.';
+  'You are a hands-on task coach for someone wearing camera glasses. Replies are spoken aloud.\n\n' +
+  'VISION: You see nothing by default. Call `take_picture` eagerly for any visual/spatial ' +
+  'question or any use of this/that/it/here/there. Never say "I can\'t see" — call the tool.\n\n' +
+  'PREAMBLE: Before calling `take_picture`, always say exactly "taking a look" — nothing else, ' +
+  'no variations. Then call the tool immediately. Never call it silently.\n\n' +
+  'AFTER A PHOTO: Only describe what is clearly visible. If the image is dark, covered, blurry, ' +
+  'or empty, say so and ask the user to uncover the lens or move into better light. Never invent ' +
+  'objects, text, or people that aren\'t there.\n\n' +
+  'HANDS-ON TASKS: One step per reply. When the user says a step is done, call `take_picture` to ' +
+  'verify before moving on.';
 
-// Soft-diarization addendum. The Realtime API has no native speaker labels;
-// near-field noise reduction + a top-tier transcription model + this prompt
-// guidance yields equivalent behavior — model only responds to the wearer.
+// Soft-diarization addendum. Near-field noise reduction + transcription model
+// + this one-liner yields wearer-only responses without native diarization.
 const REALTIME_DIARIZATION_INSTRUCTIONS =
-  '\n\nIMPORTANT — speaker awareness:\n' +
-  'The user is wearing smart glasses with a near-field microphone. ' +
-  'The PRIMARY speaker is the wearer; their voice is the only one you ' +
-  'should respond to. If you hear other voices in the background ' +
-  '(other people in the room, conversation across the room, audio from ' +
-  "a TV/radio, music, or anything that isn't the wearer speaking " +
-  'directly to you), IGNORE them completely. Only acknowledge and ' +
-  'respond to what the wearer says directly. If a non-wearer voice ' +
-  "interrupts mid-utterance, treat it as background noise and don't " +
-  'react to it.';
-
-// Wake-word gating: the Realtime API auto-fires response.create on every
-// user turn by default, which means the model talks back to *anything* it
-// hears. We disable that (create_response: false in turn_detection) and
-// manually trigger response.create only when the transcribed turn contains
-// "hey mechie" or a close mishearing. Transcription still runs on every
-// turn — that's what gives us the trigger signal — but the model only
-// responds when summoned.
-//
-// Mishearings: the transcription model (gpt-4o-transcribe / Whisper) routinely
-// renders "mechie" as several other tokens. Accept the common variants so a
-// pilot user doesn't get stranded by a single mistranscription.
-const WAKE_WORD_VARIANTS = [
-  'hey mechie', 'hey mechi', 'hey mechy', 'hey mech',
-  'hey machine', 'hey machi', 'hey machy',
-  'hey mochi', 'hey mocchi', 'hey michi', 'hey miche',
-  'hi mechie', 'hi mechi', 'hi mech',
-];
-function transcriptInvokesWake(transcript) {
-  if (!transcript) return false;
-  const normalized = transcript
-    .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return WAKE_WORD_VARIANTS.some((w) => normalized.includes(w));
-}
+  '\n\nOnly respond to the wearer (near-field voice). Background voices, TV, music, ' +
+  'and side conversations are noise — ignore them.';
 
 const TAKE_PICTURE_TOOL = {
   type: 'function',
   name: 'take_picture',
   description:
-    "Capture a fresh photo from the user's smart glasses camera. " +
-    "You have NO visual context by default — call this tool to see anything in the user's environment. " +
-    "Call EAGERLY whenever the user references a physical object, scene, or asks any visual/spatial " +
-    "question. Examples that REQUIRE this tool: 'how do I turn this off', 'what is this', 'look at this', " +
-    "'check my work', 'is this right', 'where's the button', or any use of this/that/it/here/there to " +
-    "refer to something physical. Latency is hidden by speculative pre-capture, so calling this is cheap. " +
-    "Never tell the user you can't see — call this tool instead.",
+    'Capture a fresh photo from the glasses camera. Call eagerly for any visual/spatial ' +
+    'question or any reference to this/that/it/here/there. You have no other way to see.',
   parameters: { type: 'object', properties: {}, required: [] },
 };
+
+// No-op tool the model calls to end a turn WITHOUT speaking. Defense-in-depth
+// for the relay-side addressee classifier: even if the classifier says "yes,
+// fire response.create," the model can still self-suppress here if the
+// transcript reads as side-conversation, ambient noise, or thinking-aloud.
+// Pattern recommended in OpenAI's Realtime prompting guide:
+// developers.openai.com/api/docs/guides/realtime-models-prompting
+const WAIT_FOR_USER_TOOL = {
+  type: 'function',
+  name: 'wait_for_user',
+  description:
+    'End the turn silently with no spoken output. Call this whenever the wake word "Hey cowork" ' +
+    'was not said and the utterance is not a clear follow-up in an already-awake conversation.',
+  parameters: { type: 'object', properties: {}, required: [] },
+};
+
+const WAKE_WORD_INSTRUCTION =
+  '\n\nWAKE WORD: Stay silent unless the wearer says "Hey cowork" (also accept "co-work", ' +
+  '"coworker", or any close-sounding variant). When you hear it, respond to whatever follows; ' +
+  'if nothing followed, say "Yes?". You are then awake for clear follow-ups in the same ' +
+  'exchange. Once the wearer is silent for a while or shifts to a side conversation, you are ' +
+  'asleep again until the next wake word.\n\n' +
+  'For anything without the wake word and not a clear follow-up — silence, noise, TV, music, ' +
+  'side conversation, thinking aloud — call `wait_for_user` and say NOTHING. Never ask "did ' +
+  'you say something?" or "were you talking to me?". When in doubt, stay silent.';
 
 // Global lookup of active sessions, used by HTTP /upload-photo to find the
 // right per-connection state when glasses POST a photo directly over Wi-Fi.
@@ -230,6 +183,19 @@ function broadcastToMonitors(pcm24k) {
   for (const ws of monitorClients) {
     if (ws.readyState !== WebSocket.OPEN) continue;
     try { ws.send(pcm24k); } catch { /* ignore */ }
+  }
+}
+
+// Live photo monitor: parallel to the audio monitor. /photo-monitor accepts
+// WS connections and receives one binary frame per JPEG that the relay sends
+// to OpenAI Realtime as input_image. Same purpose: a verification surface for
+// what the model is actually seeing.
+const photoMonitorClients = new Set();
+function broadcastPhotoToMonitors(jpeg) {
+  if (photoMonitorClients.size === 0) return;
+  for (const ws of photoMonitorClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    try { ws.send(jpeg); } catch { /* ignore */ }
   }
 }
 
@@ -291,6 +257,76 @@ button { font-size: 1rem; padding: .5rem 1rem; cursor: pointer; }
         (totalSamples / 24000).toFixed(1) + 's received • peak ' +
         (20 * Math.log10(Math.max(peakRecent, 1e-4))).toFixed(0) + ' dBFS';
     };
+  };
+})();
+</script></body></html>`;
+
+const PHOTO_MONITOR_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><title>mechie photo monitor</title>
+<style>
+body { font: 14px/1.5 -apple-system, sans-serif; max-width: 960px;
+       margin: 2rem auto; padding: 0 1rem; background: #fafafa; }
+h2 { margin-bottom: .25rem; }
+.sub { color: #666; margin-top: 0; font-size: 13px; }
+#status { margin: 1rem 0; color: #666; font-variant-numeric: tabular-nums; }
+#current { display: block; width: 100%; max-height: 70vh; object-fit: contain;
+           background: #111; border-radius: 8px; }
+#info { font-size: 12px; color: #888; margin-top: .35rem; text-align: right; }
+#thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+          gap: 6px; margin-top: 1rem; }
+#thumbs img { width: 100%; aspect-ratio: 4/3; object-fit: cover;
+              border-radius: 4px; cursor: pointer; opacity: .75; }
+#thumbs img:hover { opacity: 1; }
+a.audio { float: right; font-size: 13px; }
+</style></head><body>
+<a class="audio" href="/monitor">audio monitor →</a>
+<h2>mechie photo monitor</h2>
+<p class="sub">Live stream of every JPEG the relay sends to OpenAI Realtime as
+input_image. Each new photo replaces the large view; recent stay as thumbnails.</p>
+<div id="status">connecting…</div>
+<img id="current" alt="latest photo sent to OpenAI">
+<div id="info"></div>
+<div id="thumbs"></div>
+<script>
+(() => {
+  const status = document.getElementById('status');
+  const current = document.getElementById('current');
+  const info = document.getElementById('info');
+  const thumbs = document.getElementById('thumbs');
+  let count = 0;
+  const recent = []; // {url, ts, bytes}
+  const MAX = 24;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + '/photo-monitor');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { status.textContent = 'connected • waiting for photos…'; };
+  ws.onclose = () => { status.textContent = 'disconnected'; };
+  ws.onerror = () => { status.textContent = 'error'; };
+  ws.onmessage = (e) => {
+    const bytes = e.data.byteLength;
+    const blob = new Blob([e.data], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    current.src = url;
+    count++;
+    const ts = new Date().toLocaleTimeString();
+    status.textContent = count + ' photos received • latest ' + ts;
+    info.textContent = (bytes / 1024).toFixed(0) + ' KB';
+    recent.unshift({ url, ts, bytes });
+    while (recent.length > MAX) {
+      const old = recent.pop();
+      URL.revokeObjectURL(old.url);
+    }
+    thumbs.innerHTML = '';
+    for (const r of recent) {
+      const t = document.createElement('img');
+      t.src = r.url;
+      t.title = r.ts + ' • ' + (r.bytes / 1024).toFixed(0) + ' KB';
+      t.onclick = () => {
+        current.src = r.url;
+        info.textContent = (r.bytes / 1024).toFixed(0) + ' KB • ' + r.ts;
+      };
+      thumbs.appendChild(t);
+    }
   };
 })();
 </script></body></html>`;
@@ -476,6 +512,11 @@ const httpServer = createServer((req, res) => {
     res.end(MONITOR_HTML);
     return;
   }
+  if (req.method === 'GET' && req.url === '/photo-monitor') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(PHOTO_MONITOR_HTML);
+    return;
+  }
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found');
 });
@@ -499,6 +540,16 @@ wss.on('connection', async (phoneWs, req) => {
   const peer = req.socket.remoteAddress;
   // Live audio monitor clients connect to /monitor — they receive
   // re-broadcast PCM and never enter the per-session phone state machine.
+  if (req.url === '/photo-monitor') {
+    photoMonitorClients.add(phoneWs);
+    console.log(`[photo-monitor] client connected from ${peer} (total=${photoMonitorClients.size})`);
+    phoneWs.on('close', () => {
+      photoMonitorClients.delete(phoneWs);
+      console.log(`[photo-monitor] client disconnected (total=${photoMonitorClients.size})`);
+    });
+    phoneWs.on('error', () => photoMonitorClients.delete(phoneWs));
+    return;
+  }
   if (req.url === '/monitor') {
     monitorClients.add(phoneWs);
     console.log(`[monitor] client connected from ${peer} (total=${monitorClients.size})`);
@@ -661,6 +712,10 @@ function handleBinaryFromPhone(state, msg, decoder) {
     const requestId = idLen > 0 ? msg.subarray(2, 2 + idLen).toString('utf8') : '';
     const jpeg = Buffer.from(msg.subarray(2 + idLen));
     state.counters.photosReceived++;
+    // Mirror every BLE-arriving JPEG to /photo-monitor clients before any
+    // routing/filtering, so the dev can see speculative + cached + covered
+    // shots, not just the ones the model ended up using.
+    broadcastPhotoToMonitors(jpeg);
 
     if (requestId) {
       const req = state.pendingPhotoRequests.get(requestId);
@@ -776,7 +831,7 @@ async function handleUploadPhoto(req, res) {
   // Accumulate request body into a single Buffer.
   const chunks = [];
   let total = 0;
-  const MAX_BYTES = 1_000_000; // 1MB cap for safety
+  const MAX_BYTES = 5_000_000; // 5MB cap (UXGA Q4 can hit several hundred KB)
   let aborted = false;
   for await (const chunk of req) {
     total += chunk.length;
@@ -793,6 +848,8 @@ async function handleUploadPhoto(req, res) {
   const jpeg = Buffer.concat(chunks, total);
   state.counters.photosReceived++;
   state.counters.wifiPhotos++;
+  // Mirror every Wi-Fi-arriving JPEG to /photo-monitor before routing.
+  broadcastPhotoToMonitors(jpeg);
 
   // Always forward to the phone for dev visibility — without this, Wi-Fi photos never
   // touch the phone (they go glasses → relay direct), so there's no way to verify the
@@ -829,40 +886,15 @@ async function handleUploadPhoto(req, res) {
 
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 
-// Wrap accumulated 16-bit LE PCM chunks in a 44-byte WAV header so the
-// phone can play it directly via expo-av's file-based path.
-function buildWavBuffer(pcmChunks, sampleRate) {
-  let dataLen = 0;
-  for (const c of pcmChunks) dataLen += c.length;
-  const wav = Buffer.alloc(44 + dataLen);
-  wav.write('RIFF', 0);
-  wav.writeUInt32LE(36 + dataLen, 4);
-  wav.write('WAVE', 8);
-  wav.write('fmt ', 12);
-  wav.writeUInt32LE(16, 16);             // fmt chunk size (PCM)
-  wav.writeUInt16LE(1, 20);              // PCM format
-  wav.writeUInt16LE(1, 22);              // mono
-  wav.writeUInt32LE(sampleRate, 24);
-  wav.writeUInt32LE(sampleRate * 2, 28); // byte rate
-  wav.writeUInt16LE(2, 32);              // block align
-  wav.writeUInt16LE(16, 34);             // bits per sample
-  wav.write('data', 36);
-  wav.writeUInt32LE(dataLen, 40);
-  let o = 44;
-  for (const c of pcmChunks) { c.copy(wav, o); o += c.length; }
-  return wav;
-}
-
-function flushTurnWav(state) {
+// Ship one PCM chunk to the phone. flags = PCM_FLAG_FIRST | PCM_FLAG_FINAL.
+// Body is raw 24 kHz mono S16LE; phone schedules it directly onto the
+// AVAudioEngine player node for sample-accurate gapless playback.
+function sendPcmChunk(state, pcm, flags) {
   if (state.phoneWs.readyState !== WebSocket.OPEN) return;
-  const chunks = state.audioOutPcm || [];
-  state.audioOutPcm = [];
-  state.audioOutPcmBytes = 0;
-  if (chunks.length === 0) return;
-  const wav = buildWavBuffer(chunks, 24000);
-  const frame = Buffer.alloc(1 + wav.length);
-  frame.writeUInt8(TAG_RELAY_TTS, 0);
-  wav.copy(frame, 1);
+  const frame = Buffer.alloc(2 + pcm.length);
+  frame.writeUInt8(TAG_RELAY_PCM, 0);
+  frame.writeUInt8(flags, 1);
+  if (pcm.length > 0) pcm.copy(frame, 2);
   state.phoneWs.send(frame);
 }
 
@@ -890,15 +922,17 @@ function setupRealtimeConnection(state) {
         session: {
           type: 'realtime',
           model: OPENAI_REALTIME_MODEL,
-          instructions: GUIDANCE_SYSTEM_PROMPT + REALTIME_DIARIZATION_INSTRUCTIONS,
+          instructions:
+            GUIDANCE_SYSTEM_PROMPT +
+            REALTIME_DIARIZATION_INSTRUCTIONS +
+            WAKE_WORD_INSTRUCTION,
           output_modalities: ['audio'],
-          tools: [TAKE_PICTURE_TOOL],
+          tools: [TAKE_PICTURE_TOOL, WAIT_FOR_USER_TOOL],
           tool_choice: 'auto',
           max_output_tokens: 500,
-          // Higher reasoning effort: model thinks harder before replying.
-          // Trades a small amount of latency for better intent inference
-          // (especially for ambiguous visual / multi-step requests).
-          reasoning: { effort: 'high' },
+          // Reasoning disabled for every turn (including visual ones).
+          // Lowest available setting on gpt-realtime is 'minimal'.
+          reasoning: { effort: 'minimal' },
           audio: {
             input: {
               format: { type: 'audio/pcm', rate: 24000 },
@@ -913,23 +947,23 @@ function setupRealtimeConnection(state) {
               // user thinks while working). `auto` ≈ medium eagerness — switch
               // to 'low' if the model interrupts too eagerly, 'high' if it lags.
               //
-              // create_response: false → suppress the API's auto-response on
-              // every turn. We manually trigger response.create only when the
-              // transcript contains the "hey mechie" wake phrase (see the
-              // input_audio_transcription.completed handler).
-              //
-              // interrupt_response stays true so the user can still talk over
-              // an in-progress reply without re-saying the wake word.
+              // create_response: true (API default) — the model decides each
+              // turn whether to speak or call `wait_for_user` (see
+              // WAIT_FOR_USER_INSTRUCTION). The relay does NOT gate
+              // response.create with a classifier in this mode.
               turn_detection: {
                 type: 'semantic_vad',
-                eagerness: 'auto',
-                create_response: false,
+                eagerness: 'medium',
                 interrupt_response: true,
               },
             },
             output: {
               voice: process.env.OPENAI_VOICE || 'alloy',
               format: { type: 'audio/pcm', rate: 24000 },
+              // Faster-than-default delivery — TTS plays back at 1.2x without
+              // pitch shift. Supported range is 0.25–1.5. Bump via env if you
+              // want to A/B different speeds without redeploying.
+              speed: Number(process.env.OPENAI_VOICE_SPEED) || 1.2,
             },
           },
         },
@@ -970,6 +1004,9 @@ function handleRealtimeEvent(state, raw) {
       break;
 
     case 'input_audio_buffer.speech_started':
+      // Stamp speech-onset wall-clock; paired with first-audio-out delta to
+      // log end-to-end perceived latency.
+      state.speechStartedAt = Date.now();
       // Every new utterance gets a FRESH photo. If a previous turn left an
       // unconsumed speculative in the slot (model decided no tool call was
       // needed and we never cleared it), discard it now — using a stale
@@ -1001,14 +1038,7 @@ function handleRealtimeEvent(state, raw) {
         );
       }
       if (transcript) {
-        const wake = transcriptInvokesWake(transcript);
-        console.log(`  [realtime] user said: "${transcript}" wake=${wake}`);
-        if (wake && state.realtimeWs && state.realtimeWs.readyState === WebSocket.OPEN) {
-          // Wake phrase matched — manually fire the response. The model sees
-          // the full transcript including the wake phrase; that's fine, it's
-          // good at filtering "hey mechie, ..." down to the actual request.
-          state.realtimeWs.send(JSON.stringify({ type: 'response.create' }));
-        }
+        console.log(`  [realtime] user said: "${transcript}"`);
       } else {
         // VAD committed a buffer but the transcriber found no speech.
         // Usually noise (cough, click, bump) — non-fatal, just logged.
@@ -1028,31 +1058,47 @@ function handleRealtimeEvent(state, raw) {
     case 'response.created':
       state.llmInFlight = true;
       state.responseStartedAt = Date.now();
-      state.audioOutPcm = [];
+      state.audioOutSentFirst = false;
       state.audioOutPcmBytes = 0;
       break;
 
-    // Model emits 24 kHz signed 16-bit LE PCM. Accumulate the whole turn
-    // and ship as one self-contained 24 kHz mono WAV at audio.done. One
-    // file per turn = no chunk boundaries = guaranteed gapless within a
-    // turn. Trade is TTFA = full audio-generation duration (~1.5-2.5s
-    // for typical replies, since gpt-realtime generates faster than
-    // realtime). GA renamed response.audio.* → response.output_audio.*.
+    // Model emits 24 kHz signed 16-bit LE PCM. We forward each delta to the
+    // phone immediately so playback starts ~hundreds of ms after the first
+    // byte arrives instead of waiting for the full turn. Gapless playback is
+    // preserved on the phone side by chaining AVAudioPlayerNode scheduleBuffer
+    // calls — chunk boundaries are sample-aligned. GA renamed response.audio.*
+    // → response.output_audio.*.
     case 'response.output_audio.delta':
     case 'response.audio.delta': {
       const audioB64 = msg.delta;
       if (!audioB64) break;
-      if (!state.audioOutPcm) state.audioOutPcm = [];
       const buf = Buffer.from(audioB64, 'base64');
-      state.audioOutPcm.push(buf);
+      if (buf.length === 0) break;
+      const isFirst = !state.audioOutSentFirst;
+      state.audioOutSentFirst = true;
       state.audioOutPcmBytes = (state.audioOutPcmBytes || 0) + buf.length;
+      sendPcmChunk(state, buf, isFirst ? PCM_FLAG_FIRST : 0);
+      if (isFirst) {
+        const ttfa = state.responseStartedAt
+          ? Date.now() - state.responseStartedAt
+          : -1;
+        console.log(`  [audio] first chunk ${buf.length}B ttfa_ms=${ttfa}`);
+        if (state.speechStartedAt) {
+          console.log(`[total ms: ${Date.now() - state.speechStartedAt}]`);
+          state.speechStartedAt = 0;
+        }
+      }
       break;
     }
 
     case 'response.output_audio.done':
     case 'response.audio.done': {
       const bytes = state.audioOutPcmBytes || 0;
-      flushTurnWav(state);
+      // Final marker. Empty payload — its only job is to signal end-of-turn
+      // so the phone can flip agentSpeaking off once the player drains.
+      sendPcmChunk(state, Buffer.alloc(0), PCM_FLAG_FINAL);
+      state.audioOutSentFirst = false;
+      state.audioOutPcmBytes = 0;
       const elapsedMs = state.responseStartedAt
         ? Date.now() - state.responseStartedAt
         : -1;
@@ -1146,6 +1192,28 @@ function handleRealtimeEvent(state, raw) {
 }
 
 async function handleRealtimeToolCall(state, callId, name, _argsStr) {
+  if (name === 'wait_for_user') {
+    // Model decided the latest audio wasn't addressed to it. Acknowledge
+    // the tool so the API closes the response cleanly, but do NOT fire
+    // another response.create — silence is the point. Don't push anything
+    // to conversation history either; the suppressed turn shouldn't
+    // pollute the classifier's context.
+    console.log('  [realtime] wait_for_user — model self-suppressed');
+    const ws = state.realtimeWs;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: 'ok',
+          },
+        }),
+      );
+    }
+    return;
+  }
   if (name !== 'take_picture') {
     console.warn('  [realtime] unknown tool:', name);
     return;
@@ -1208,6 +1276,12 @@ async function handleRealtimeToolCall(state, callId, name, _argsStr) {
   // near-black covered-lens image lets the model "see" pixels and invent
   // content (gpt-realtime-2 has hallucinated objects from dark frames).
   // The function_call_output above already told it the lens is covered.
+  //
+  // detail: "high" forces multi-tile full-resolution processing instead of
+  // the default 512×512 thumbnail. Roughly 5-10× more vision tokens per
+  // image but materially better at small text, fine objects, screen
+  // contents, and anything where detail matters. Worth the cost given
+  // the wearable's whole point is letting the model see what the user sees.
   if (photo && !photoLooksCovered) {
     ws.send(
       JSON.stringify({
@@ -1219,6 +1293,7 @@ async function handleRealtimeToolCall(state, callId, name, _argsStr) {
             {
               type: 'input_image',
               image_url: `data:image/jpeg;base64,${photo.toString('base64')}`,
+              detail: 'high',
             },
           ],
         },

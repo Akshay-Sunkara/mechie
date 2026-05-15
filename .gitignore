@@ -30,3 +30,6 @@ build/
 .cache/
 .expo/
 *.tsbuildinfo
+
+# Outreach (contains API keys and prospect PII)
+outreach/

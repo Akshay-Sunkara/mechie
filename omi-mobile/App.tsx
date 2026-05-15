@@ -20,6 +20,7 @@ import { BleManager, Device, Subscription } from 'react-native-ble-plx';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { ExpoPlayAudioStream } from '@mykin-ai/expo-audio-stream';
 // omi BLE service / characteristics — same UUIDs the firmware advertises.
 // (omi/app/lib/services/devices/models.dart)
 const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
@@ -57,8 +58,11 @@ const MAX_PHOTOS_KEPT = 24;
 // Wire-protocol tag bytes (must match relay/relay.js)
 const TAG_PHONE_OPUS = 0x01;
 const TAG_PHONE_PHOTO = 0x02;
-const TAG_RELAY_TTS = 0x10;            // self-contained WAV of model audio
+const TAG_RELAY_PCM = 0x10;            // streaming PCM chunk (24 kHz S16LE)
 const TAG_RELAY_WIFI_PHOTO = 0x20;
+// Flag bits in byte 1 of TAG_RELAY_PCM frames.
+const PCM_FLAG_FIRST = 0x01;
+const PCM_FLAG_FINAL = 0x02;
 
 // Relay endpoint. Hardcoded for now; not user-facing.
 const RELAY_URL = 'wss://omi-relay-aksay95.fly.dev';
@@ -123,22 +127,25 @@ export default function App() {
   const deviceRef = useRef<Device | null>(null);
   const subsRef = useRef<Subscription[]>([]);
   const relayWsRef = useRef<WebSocket | null>(null);
-  const ttsSoundRef = useRef<Audio.Sound | null>(null);
+  // Streaming TTS: relay forwards each OpenAI audio.delta as a PCM chunk.
+  // currentTurnIdRef is the per-turn ID handed to ExpoPlayAudioStream so the
+  // native player can group consecutive chunks into one scheduled stream.
   const ttsCounterRef = useRef(0);
-  const ttsQueueRef = useRef<string[]>([]);
-  const ttsBusyRef = useRef(false);
+  const currentTurnIdRef = useRef<string | null>(null);
+  const ttsBytesThisTurnRef = useRef(0);
+  // Safety watchdog: forces agentSpeaking off if the soundChunkPlayed
+  // event never fires after the relay's final marker (e.g. native event
+  // dropped). Sized off the bytes actually shipped this turn.
+  const ttsWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Mic mute. The breathing orb taps into this; flushOpusFrame consults
   // mutedRef on every BLE callback so we drop frames at the source.
   const [muted, setMuted] = useState(false);
   const mutedRef = useRef(false);
   useEffect(() => { mutedRef.current = muted; }, [muted]);
-  // Mirror of ttsBusyRef for the orb's "speaking" breathing pattern.
-  // Set/cleared from the TTS queue lifecycle.
+  // Drives the orb's "speaking" breathing pattern. Set on first chunk of a
+  // turn, cleared either by the native soundChunkPlayed(isFinal=true) event
+  // or the watchdog above.
   const [agentSpeaking, setAgentSpeaking] = useState(false);
-  // Generation counter for the TTS queue. clearTtsQueue() bumps it; any
-  // drainTtsQueue() running with a stale gen exits without touching state.
-  // Prevents stale audio from a previous session bleeding into a new one.
-  const ttsGenRef = useRef(0);
   // Latency probe: wall-clock ms when Deepgram's is_final arrived for the
   // current user turn. Cleared once the corresponding TTS audio shows up.
   // Deepgram's endpointing window adds ~300ms on top — see DG_ENDPOINTING_MS.
@@ -191,6 +198,27 @@ export default function App() {
       shouldDuckAndroid: true,
       allowsRecordingIOS: false,
     }).catch((e) => console.warn('audio mode error', e));
+    // OpenAI Realtime emits 24 kHz mono S16LE. Configure the native sound
+    // player to match so AVAudioPCMBuffers are constructed at the right rate
+    // and the engine resamples to hardware output internally. 'regular'
+    // playback mode skips the voiceProcessing path (AEC + half-duplex) that
+    // would degrade quality and reduce volume.
+    ExpoPlayAudioStream.setSoundConfig({
+      sampleRate: 24000 as any, // TS types limit to 16k/44.1k/48k; native accepts any double
+      playbackMode: 'regular',
+    }).catch((e) => console.warn('sound config error', e));
+    // Native player fires this when the queued chunks drain. With the
+    // built-in debounce on the native side, isFinal=true only fires once
+    // a real gap forms — safe to use as the "agent stopped speaking" signal.
+    const chunkSub = ExpoPlayAudioStream.subscribeToSoundChunkPlayed(async (e: { isFinal: boolean }) => {
+      if (e?.isFinal) {
+        setAgentSpeaking(false);
+        if (ttsWatchdogRef.current) {
+          clearTimeout(ttsWatchdogRef.current);
+          ttsWatchdogRef.current = null;
+        }
+      }
+    });
     // Hydrate persisted Wi-Fi creds (check both new and legacy keys).
     (async () => {
       try {
@@ -207,8 +235,8 @@ export default function App() {
       teardown();
       managerRef.current?.destroy();
       managerRef.current = null;
-      ttsSoundRef.current?.unloadAsync().catch(() => { });
-      ttsSoundRef.current = null;
+      try { chunkSub.remove(); } catch { }
+      ExpoPlayAudioStream.stopSound().catch(() => { });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -222,6 +250,22 @@ export default function App() {
 
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { wifiStateRef.current = wifiState; }, [wifiState]);
+
+  // Wi-Fi connect watchdog: if the firmware's READY/FAILED notification never
+  // arrives (BLE drop, firmware hang, association silently failing), the UI
+  // would otherwise stay stuck at CONNECTING — disabled button, spinner
+  // forever, inputs read-only. After 20s in CONNECTING, force FAILED so the
+  // user sees the "Retry Wi-Fi" button and can try again.
+  useEffect(() => {
+    if (wifiState !== WIFI_STATE_CONNECTING) return;
+    const t = setTimeout(() => {
+      if (wifiStateRef.current === WIFI_STATE_CONNECTING) {
+        console.warn('[wifi] connect watchdog fired — forcing FAILED');
+        setWifiState(WIFI_STATE_FAILED);
+      }
+    }, 20000);
+    return () => clearTimeout(t);
+  }, [wifiState]);
 
   // Auto-enter guidance once wearable + Wi-Fi are both ready.
   useEffect(() => {
@@ -418,9 +462,15 @@ export default function App() {
       const buf = e.data as ArrayBuffer;
       if (!buf || buf.byteLength < 1) return;
       const view = new Uint8Array(buf);
-      if (view[0] === TAG_RELAY_TTS) {
-        // Latency probe — paired with the most recent is_final transcript.
-        if (lastFinalTsRef.current > 0) {
+      if (view[0] === TAG_RELAY_PCM) {
+        if (buf.byteLength < 2) return;
+        const flags = view[1];
+        const isFirst = (flags & PCM_FLAG_FIRST) !== 0;
+        const isFinal = (flags & PCM_FLAG_FINAL) !== 0;
+        const pcm = view.subarray(2);
+        // Latency probe — fires on the first chunk of each turn, paired
+        // with the most recent is_final transcript.
+        if (isFirst && lastFinalTsRef.current > 0) {
           const finalToAudio = Date.now() - lastFinalTsRef.current;
           const speechToAudio = finalToAudio + DG_ENDPOINTING_MS;
           console.log(
@@ -429,7 +479,7 @@ export default function App() {
           );
           lastFinalTsRef.current = 0;
         }
-        playTts(view.subarray(1));
+        handlePcmChunk(pcm, isFirst, isFinal);
       } else if (view[0] === TAG_RELAY_WIFI_PHOTO) {
         // Wi-Fi photo forwarded by relay. Captured for the agent; not displayed.
         const jpeg = new Uint8Array(view.byteLength - 1);
@@ -487,54 +537,59 @@ export default function App() {
     if (!text) return;
     if (msg.is_final) {
       // Stamp the moment the user's utterance was finalized. Paired with
-      // the next TAG_RELAY_TTS arrival to print the round-trip.
+      // the next TAG_RELAY_PCM first-chunk arrival to print the round-trip.
       lastFinalTsRef.current = Date.now();
     }
     appendOrReplaceUserStt(text, !!msg.is_final);
   }
 
-  // ---- File-based TTS playback -----------------------------------------
-  // The relay sends one self-contained WAV per turn (TAG_RELAY_TTS, tag
-  // byte 0x10). We write it to cache and play via expo-av Audio.Sound.
-  // One file = no chunk boundaries = guaranteed gapless within a turn.
-  // Trade is TTFA = full audio-generation duration, but expo-av's
-  // file-based playback is rock-solid where streaming alternatives glitch.
-  async function playTts(audio: Uint8Array) {
+  // ---- Streaming TTS playback ------------------------------------------
+  // Relay forwards each OpenAI audio.delta as its own TAG_RELAY_PCM frame
+  // ([flags][PCM s16le]). We hand each chunk to ExpoPlayAudioStream.playSound
+  // with a stable per-turn ID; the native side decodes base64 → AVAudioPCMBuffer
+  // and chains scheduleBuffer calls on AVAudioPlayerNode, which produces
+  // sample-accurate gapless playback across chunks. First-chunk arrival flips
+  // the orb to "speaking"; the native soundChunkPlayed(isFinal=true) event
+  // flips it back off once the queue drains.
+  async function handlePcmChunk(pcm: Uint8Array, isFirst: boolean, isFinal: boolean) {
     try {
-      const id = ++ttsCounterRef.current;
-      const path = (FileSystem.cacheDirectory ?? '') + `tts-${id}.wav`;
-      await FileSystem.writeAsStringAsync(path, bytesToB64(audio), {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      ttsQueueRef.current.push(path);
-      drainTtsQueue();
+      if (isFirst) {
+        // Cancel any leftover watchdog from a previous turn that got
+        // pre-empted by a new utterance before its drain event fired.
+        if (ttsWatchdogRef.current) {
+          clearTimeout(ttsWatchdogRef.current);
+          ttsWatchdogRef.current = null;
+        }
+        const id = ++ttsCounterRef.current;
+        currentTurnIdRef.current = `turn-${id}-${Date.now()}`;
+        ttsBytesThisTurnRef.current = 0;
+        setAgentSpeaking(true);
+      }
+      const turnId = currentTurnIdRef.current;
+      if (turnId && pcm.length > 0) {
+        ttsBytesThisTurnRef.current += pcm.length;
+        const b64 = bytesToB64(pcm);
+        // Note: not awaited — playSound queues to a native serial dispatch
+        // queue, so call order is preserved without forcing the WS thread
+        // to wait on the round-trip per chunk.
+        ExpoPlayAudioStream.playSound(b64, turnId, 'pcm_s16le').catch((err) => {
+          console.warn('[tts] playSound failed', err);
+        });
+      }
+      if (isFinal) {
+        // Sized off the actual bytes shipped: 24kHz * 2B/sample = 48000 B/s,
+        // plus a 2s safety margin and a 4s floor for short replies.
+        const audioMs = (ttsBytesThisTurnRef.current / 48000) * 1000;
+        const watchdogMs = Math.max(audioMs + 2000, 4000);
+        ttsWatchdogRef.current = setTimeout(() => {
+          ttsWatchdogRef.current = null;
+          setAgentSpeaking(false);
+          console.log(`[tts] watchdog forced agentSpeaking=false @${watchdogMs.toFixed(0)}ms`);
+        }, watchdogMs);
+        currentTurnIdRef.current = null;
+      }
     } catch (err) {
-      console.warn('[tts] queue write failed', err);
-    }
-  }
-
-  async function drainTtsQueue() {
-    if (ttsBusyRef.current) return;
-    ttsBusyRef.current = true;
-    setAgentSpeaking(true);
-    const myGen = ttsGenRef.current;
-    try {
-      while (ttsQueueRef.current.length > 0 && myGen === ttsGenRef.current) {
-        const path = ttsQueueRef.current.shift()!;
-        await playSingleTts(path);
-      }
-    } finally {
-      // Only reset state if we're still the active drain — clearTtsQueue
-      // increments the generation and resets these synchronously, so we must
-      // not stomp on a fresh drain that may have started in the meantime.
-      if (myGen === ttsGenRef.current) {
-        ttsBusyRef.current = false;
-        ttsSoundRef.current = null;
-        setAgentSpeaking(false);
-        console.log('[tts] queue drained');
-      } else {
-        console.log('[tts] queue drain superseded by clear');
-      }
+      console.warn('[tts] chunk handling failed', err);
     }
   }
 
@@ -542,56 +597,14 @@ export default function App() {
   // OR involuntary) and on mode change to idle, so a stale reply from the
   // previous session can't bleed into the next one.
   function clearTtsQueue() {
-    ttsGenRef.current++;
-    ttsQueueRef.current = [];
-    const sound = ttsSoundRef.current;
-    if (sound) {
-      sound.stopAsync().catch(() => { });
-      sound.unloadAsync().catch(() => { });
-      ttsSoundRef.current = null;
+    ExpoPlayAudioStream.stopSound().catch(() => { });
+    if (ttsWatchdogRef.current) {
+      clearTimeout(ttsWatchdogRef.current);
+      ttsWatchdogRef.current = null;
     }
-    ttsBusyRef.current = false;
+    currentTurnIdRef.current = null;
+    ttsBytesThisTurnRef.current = 0;
     setAgentSpeaking(false);
-  }
-
-  // Plays one WAV to completion. Resolves on didJustFinish OR on a watchdog
-  // timeout — never blocks the queue forever.
-  async function playSingleTts(path: string): Promise<void> {
-    let resolved = false;
-    let sound: Audio.Sound | null = null;
-    let watchdog: ReturnType<typeof setTimeout> | null = null;
-    return new Promise<void>((resolve) => {
-      const finish = (reason: string) => {
-        if (resolved) return;
-        resolved = true;
-        if (watchdog) { clearTimeout(watchdog); watchdog = null; }
-        if (sound) sound.unloadAsync().catch(() => { });
-        FileSystem.deleteAsync(path, { idempotent: true }).catch(() => { });
-        if (reason !== 'didJustFinish') {
-          console.log(`[tts] segment finished (${reason})`);
-        }
-        resolve();
-      };
-      Audio.Sound.createAsync({ uri: path }, { shouldPlay: true })
-        .then(({ sound: s, status }) => {
-          sound = s;
-          ttsSoundRef.current = s;
-          const durationMs =
-            'isLoaded' in status && status.isLoaded
-              ? status.durationMillis ?? 0
-              : 0;
-          const watchdogMs = durationMs > 0 ? durationMs + 1500 : 20000;
-          watchdog = setTimeout(() => finish(`watchdog@${watchdogMs}ms`), watchdogMs);
-          s.setOnPlaybackStatusUpdate((st) => {
-            if (!('isLoaded' in st) || !st.isLoaded) return;
-            if (st.didJustFinish) finish('didJustFinish');
-          });
-        })
-        .catch((err) => {
-          console.warn('[tts] segment play failed', err);
-          finish('error');
-        });
-    });
   }
 
   async function ensureAndroidPerms(): Promise<boolean> {
